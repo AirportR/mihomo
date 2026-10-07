@@ -62,8 +62,9 @@ const (
 	DefaultUDPTimeout = dialer.DefaultUDPTimeout
 	DefaultDropTime   = 12 * DefaultTCPTimeout
 	DefaultTLSTimeout = DefaultTCPTimeout
-	DefaultTestURL    = "https://www.gstatic.com/generate_204"
 )
+
+var DefaultTestURL = "https://www.gstatic.com/generate_204"
 
 var ErrNotSupport = errors.New("no support")
 
@@ -302,6 +303,17 @@ func (s *packetAdapter) Metadata() *Metadata {
 // Key is a SNAT key
 func (s *packetAdapter) Key() string {
 	return s.key
+}
+
+type PacketRejector interface {
+	Reject() error
+}
+
+func (s *packetAdapter) Reject() error {
+	if rejector, ok := s.UDPPacket.(PacketRejector); ok {
+		return rejector.Reject()
+	}
+	return nil
 }
 
 func NewPacketAdapter(packet UDPPacket, metadata *Metadata) PacketAdapter {
