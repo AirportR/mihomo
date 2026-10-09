@@ -56,6 +56,7 @@ const (
 	EasyTier
 	GostRelay
 	X365
+	Miu
 )
 
 const (
@@ -245,6 +246,8 @@ func (at AdapterType) String() string {
 		return "GostRelay"
 	case X365:
 		return "X365"
+	case Miu:
+		return "Miu"
 	case Relay:
 		return "Relay"
 	case Selector:
