@@ -2,15 +2,33 @@ package outbound
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
 	"net"
 	"strconv"
 	"strings"
 
+	utls "github.com/metacubex/utls"
+
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/transport/ninja"
 )
+
+// utlsID maps a fingerprint name to a uTLS hello id.
+func utlsID(name string) utls.ClientHelloID {
+	switch strings.ToLower(name) {
+	case "chrome":
+		return utls.HelloChrome_Auto
+	case "firefox":
+		return utls.HelloFirefox_Auto
+	case "safari":
+		return utls.HelloSafari_Auto
+	case "edge":
+		return utls.HelloEdge_Auto
+	case "random":
+		return utls.HelloRandomized
+	}
+	return utls.HelloChrome_Auto
+}
 
 // Ninja is the ninja tunnel outbound.
 //
@@ -61,6 +79,7 @@ type NinjaOption struct {
 	Servername       string            `proxy:"servername,omitempty"`
 	SNI              string            `proxy:"sni,omitempty"`
 	SkipCertVerify   bool              `proxy:"skip-cert-verify,omitempty"`
+	ClientFingerprint string           `proxy:"client-fingerprint,omitempty"`
 	Network          string            `proxy:"network,omitempty"`
 	WSOpts           NinjaWSOptions    `proxy:"ws-opts,omitempty"`
 	Pass             bool              `proxy:"pass,omitempty"`
@@ -88,15 +107,21 @@ func (n *Ninja) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn
 		if sni == "" {
 			sni = n.option.Server
 		}
-		tc := tls.Client(conn, &tls.Config{
+		// The reference client speaks uTLS with a Chrome fingerprint; a plain
+		// crypto/tls hello is rejected by the service.
+		fingerprint := n.option.ClientFingerprint
+		if fingerprint == "" {
+			fingerprint = "chrome"
+		}
+		uConn := utls.UClient(conn, &utls.Config{
 			ServerName:         sni,
 			InsecureSkipVerify: n.option.SkipCertVerify,
 			NextProtos:         []string{"http/1.1"},
-		})
-		if err = tc.HandshakeContext(ctx); err != nil {
+		}, utlsID(fingerprint))
+		if err = uConn.HandshakeContext(ctx); err != nil {
 			return nil, fmt.Errorf("%s tls error: %w", n.addr, err)
 		}
-		conn = tc
+		conn = uConn
 	}
 	if strings.EqualFold(n.option.Network, "ws") {
 		host := n.option.Servername

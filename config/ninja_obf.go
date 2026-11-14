@@ -270,9 +270,10 @@ func ProcessNinjaObfuscation(proxies []map[string]any, raw []byte) {
 		if !ninjaBool(p, "tls") {
 			continue
 		}
-		if err := restoreNinjaNode(p); err != nil {
-			delete(p, "tls")
-		}
+		// only a successful restore consumes the marker; a failed one must leave
+		// the transport flags untouched, otherwise plain "tls: true" proxies
+		// silently lose TLS.
+		_ = restoreNinjaNode(p)
 	}
 	info, ok := extractNinjaPassInfo(raw)
 	if !ok {

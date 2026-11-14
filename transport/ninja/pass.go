@@ -16,7 +16,9 @@ package ninja
 // starts as the salt and is bumped (little endian) after each Seal/Open.
 
 import (
+	"bytes"
 	"crypto/aes"
+	"os"
 	"crypto/cipher"
 	"crypto/hkdf"
 	"crypto/rand"
@@ -122,6 +124,10 @@ type PassConn struct {
 	decShake sha3.ShakeHash
 
 	rbuf []byte
+
+	// server side: strip the peer's first record prefix (token + marker [+ addr])
+	server   bool
+	stripped bool
 }
 
 // NewPassConn wraps raw. socksAddr, when not nil, is announced in the first
@@ -134,6 +140,13 @@ func NewPassConn(raw net.Conn, cfg *PassConfig, socksAddr []byte) *PassConn {
 		c.prefix = append([]byte{0x03, 0x01}, socksAddr...)
 	}
 	return c
+}
+
+// NewPassServerConn wraps a server side transport. The peer (client) prefixes its
+// first record with token(16)||0x01 (or token||0x03||socksAddr); the server strips
+// it before handing the core stream upwards.
+func NewPassServerConn(raw net.Conn, cfg *PassConfig) *PassConn {
+	return &PassConn{Conn: raw, cfg: cfg, server: true}
 }
 
 func (c *PassConn) initEnc() error {
@@ -190,18 +203,21 @@ func (c *PassConn) Write(b []byte) (int, error) {
 	}
 	payload := b
 	first := !c.sent
-	if first {
+	c.sent = true
+	if first && !c.server {
 		buf := make([]byte, 0, len(c.cfg.token)+len(c.prefix)+len(b))
 		buf = append(buf, c.cfg.token[:]...)
 		buf = append(buf, c.prefix...)
 		buf = append(buf, b...)
 		payload = buf
-		c.sent = true
 	}
 	if len(payload) > 0xffff {
 		return 0, fmt.Errorf("ninja: pass record too large (%d)", len(payload))
 	}
 	pad := c.cfg.Padding.PaddingLen(len(payload))
+	if os.Getenv("NINJA_DEBUG") != "" {
+		println("[ninja] pass write payload", len(payload), "pad", pad, "first", first, "nonce0", int(c.encNonce[0]), "server", c.server)
+	}
 	if pad < 0 {
 		pad = 0
 	}
@@ -248,6 +264,9 @@ func (c *PassConn) readRecord() error {
 	if _, err := io.ReadFull(c.Conn, hdrCt); err != nil {
 		return err
 	}
+	if os.Getenv("NINJA_DEBUG") != "" {
+		println("[ninja] pass read hdr try nonce0", int(c.decNonce[0]), "nonce1", int(c.decNonce[1]), "server", c.server)
+	}
 	hdr, err := c.decAEAD.Open(nil, c.decNonce, hdrCt, nil)
 	if err != nil {
 		return fmt.Errorf("ninja: pass header: %w", err)
@@ -270,8 +289,59 @@ func (c *PassConn) readRecord() error {
 		return fmt.Errorf("ninja: pass body: %w", err)
 	}
 	incPassNonce(c.decNonce)
+	if os.Getenv("NINJA_DEBUG") != "" {
+		println("[ninja] pass read ln", ln, "pad", pad, "server", c.server, "nonce0", int(c.decNonce[0]))
+	}
 	c.rbuf = body[:ln]
+	if c.server && !c.stripped {
+		c.stripped = true
+		payload := c.rbuf
+		if len(payload) < 17 {
+			return fmt.Errorf("ninja: short first payload %d", len(payload))
+		}
+		if !bytes.Equal(payload[:16], c.cfg.token[:]) {
+			// still surface the stream; upper layer reports the mismatch
+		}
+		marker := payload[16]
+		cut := 17
+		switch marker {
+		case 0x01:
+		case 0x03:
+			if len(payload) < 18 {
+				return fmt.Errorf("ninja: short socks first payload")
+			}
+			// payload[16]=0x03, payload[17]=0x01 and the socks address (which
+			// starts with its own ATYP byte) follows right after.
+			alen := socksAddrLen(payload[18:])
+			cut = 18 + alen
+		default:
+			return fmt.Errorf("ninja: unknown pass marker %#x", marker)
+		}
+		if len(payload) < cut {
+			return fmt.Errorf("ninja: first payload %d < prefix %d", len(payload), cut)
+		}
+		c.rbuf = payload[cut:]
+	}
 	return nil
+}
+
+// socksAddrLen returns the encoded length of a socks5 address.
+func socksAddrLen(b []byte) int {
+	if len(b) == 0 {
+		return 0
+	}
+	switch b[0] {
+	case 0x01:
+		return 1 + 4 + 2
+	case 0x03:
+		if len(b) < 2 {
+			return 0
+		}
+		return 1 + 1 + int(b[1]) + 2
+	case 0x04:
+		return 1 + 16 + 2
+	}
+	return 0
 }
 
 // Read returns payload bytes of the decrypted records.

@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 )
 
@@ -120,6 +121,9 @@ func (c *ninjaWSConn) readFrame() ([]byte, error) {
 		}
 	}
 	if op == 0x8 {
+		if os.Getenv("NINJA_DEBUG") != "" {
+			println("[ninja] ws close frame code/len:", len(payload), string(payload))
+		}
 		return nil, io.EOF
 	}
 	return payload, nil

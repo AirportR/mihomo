@@ -477,10 +477,6 @@ func Parse(buf []byte) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(rawCfg.Proxy) > 0 {
-		ProcessNinjaObfuscation(rawCfg.Proxy, buf)
-	}
-
 	return ParseRawConfig(rawCfg)
 }
 
@@ -620,6 +616,9 @@ func UnmarshalRawConfig(buf []byte) (*RawConfig, error) {
 
 	if err := yaml.Unmarshal(buf, rawCfg); err != nil {
 		return nil, err
+	}
+	if len(rawCfg.Proxy) > 0 {
+		ProcessNinjaObfuscation(rawCfg.Proxy, buf)
 	}
 
 	return rawCfg, nil
