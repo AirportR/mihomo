@@ -1,12 +1,18 @@
 package miu
 
 import (
+	"bytes"
 	"context"
-	"crypto/tls"
 	"errors"
+	mrand "math/rand"
 	"net"
 	"sync"
 	"time"
+
+	"github.com/metacubex/mihomo/transport/anytls/padding"
+
+	M "github.com/metacubex/sing/common/metadata"
+	"github.com/metacubex/sing/common/uot"
 )
 
 const (
@@ -16,17 +22,20 @@ const (
 	// closed after defaultLaneIdle. Neither exceeds what the server announced minus 5s.
 	defaultLaneIdle = 30 * time.Second
 	warmLaneIdle    = 120 * time.Second
-	warmLanes       = 4
+	warmLanes       = 8
 	// abortDrain is how long an aborted stream waits for the server's END before giving the lane up.
 	abortDrain = 3 * time.Second
 	// Only when two streams are opened within laneBurstWindow is the pool topped up to minIdle lanes in
 	// the background: an occasional background connection is not worth extra handshakes.
 	laneBurstWindow = 10 * time.Second
-	defaultMinIdle  = 2
+	defaultMinIdle  = 1
 	maxIdleLanes    = 32
 	// firstPayloadWait is how long a new stream waits for the application's first bytes, so that they
 	// leave in the same packet as OPEN.
 	firstPayloadWait = 10 * time.Millisecond
+	// preauthLaneTTL is how long a lane that has not been used yet (and so has not sent its header) waits
+	// in the pool: under the server's 60 s handshake timeout, jittered down to 80% per lane.
+	preauthLaneTTL = 55 * time.Second
 	// replayLimit: a stream that hit a dead pooled lane is replayed on a fresh one only while it has
 	// sent no more than this much and has not received anything.
 	replayLimit = 64 << 10
@@ -39,9 +48,11 @@ var ErrClientClosed = errors.New("miu: client closed")
 type ClientConfig struct {
 	// PSK is the pre-shared key, used as a string exactly as the server has it.
 	PSK string
+	// PaddingScheme overrides the PSK-derived initial scheme when non-empty.
+	PaddingScheme string
 	// Dial opens a connection to the server and completes the outer TLS handshake on it. Raw segments
-	// are available when the result is a *crypto/tls.Conn (or a uTLS connection) sitting directly on
-	// the TCP connection. See TLSDialer.
+	// are available when the result is a Go TLS connection (see tlsBuffers) sitting directly on the
+	// TCP connection.
 	Dial func(ctx context.Context) (net.Conn, error)
 	// LaneIdle is how long an idle lane beyond the newest four is kept (default 30s).
 	LaneIdle time.Duration
@@ -55,6 +66,12 @@ type ClientConfig struct {
 type Client struct {
 	cfg   ClientConfig
 	token [32]byte
+
+	paddingMu sync.RWMutex
+	padding   *padding.PaddingFactory
+	// derived: padding is the PSK-derived scheme (nothing configured, nothing pushed by the server), so
+	// each lane draws its own scheme from that family.
+	derived bool
 
 	mu       sync.Mutex
 	idle     []idleLane
@@ -85,60 +102,105 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if cfg.MinIdle <= 0 {
 		cfg.MinIdle = defaultMinIdle
 	}
-	return &Client{cfg: cfg, token: token}, nil
-}
-
-// TLSDialer returns a ClientConfig.Dial that connects to address over TCP and performs a TLS handshake
-// with cfg. A config without ServerName gets the host of address.
-//
-// The handshake is restricted to TLS 1.3, and Go's dynamic record sizing is switched off so that records
-// leave with the lengths the padding scheme asks for.
-func TLSDialer(address string, cfg *tls.Config) func(ctx context.Context) (net.Conn, error) {
-	if cfg == nil {
-		cfg = &tls.Config{}
+	scheme := cfg.PaddingScheme
+	if scheme == "" {
+		derived, err := derivedScheme(token)
+		if err != nil {
+			return nil, err
+		}
+		scheme = derived
 	}
-	cfg = cfg.Clone()
-	cfg.MinVersion = tls.VersionTLS13
-	cfg.DynamicRecordSizingDisabled = true
-	// No TCP keep-alive probes: an idle lane is meant to be silent.
-	d := &tls.Dialer{NetDialer: &net.Dialer{Timeout: defaultDialTimeout, KeepAlive: -1}, Config: cfg}
-	return func(ctx context.Context) (net.Conn, error) {
-		return d.DialContext(ctx, "tcp", address)
+	p := padding.NewPaddingFactory([]byte(scheme))
+	if p == nil {
+		return nil, errors.New("miu: bad padding scheme")
 	}
+	return &Client{cfg: cfg, token: token, padding: p, derived: cfg.PaddingScheme == ""}, nil
 }
 
 // ---- the lane pool ----
 
-// dial opens a new lane: the outer handshake, then the authentication header, its padding and Settings
-// in a single write. Nothing is waited for.
+func (c *Client) currentPadding() *padding.PaddingFactory {
+	p, _ := c.basePadding()
+	return p
+}
+
+// basePadding returns the scheme new lanes start from and whether it is the PSK-derived one.
+func (c *Client) basePadding() (*padding.PaddingFactory, bool) {
+	c.paddingMu.RLock()
+	p, derived := c.padding, c.derived
+	c.paddingMu.RUnlock()
+	if p == nil {
+		return padding.NewPaddingFactory(padding.DefaultPaddingScheme), false
+	}
+	return p, derived
+}
+
+func (c *Client) updatePadding(p *padding.PaddingFactory) {
+	if p == nil {
+		return
+	}
+	c.paddingMu.Lock()
+	c.padding, c.derived = p, false
+	c.paddingMu.Unlock()
+}
+
+// dial opens a new lane: the outer handshake. The authentication header, its padding and Settings are not
+// written yet: they go at the start of the lane's first write, in the same record — for a lane dialed
+// for a stream, the stream's opening packet, which follows within firstPayloadWait; for a lane that
+// warms the pool, whatever stream takes it. Nothing is waited for.
 func (c *Client) dial(ctx context.Context) (*lane, error) {
 	conn, err := c.cfg.Dial(ctx)
 	if err != nil {
 		return nil, err
 	}
 	l := newLane(conn, false, !c.cfg.DisableRaw)
-	scheme := l.scheme.Load()
-	padlen := scheme.padding0()
-	hello := append(make([]byte, 0, authHead+int(padlen)+64), c.token[:]...)
+	l.client = c
+	base, derived := c.basePadding()
+	scheme := base
+	if derived {
+		scheme = newLaneScheme(c.token, base)
+	}
+	l.base = base
+	l.scheme.Store(scheme)
+	padlen := authPadding(scheme)
+	hello := append(make([]byte, 0, authHead+padlen+64), c.token[:]...)
 	hello = append(hello, byte(padlen>>8), byte(padlen))
 	hello = append(hello, make([]byte, padlen)...)
-	hello = appendFrame(hello, frSettings, l.settingsText("\npadding-md5="+scheme.md5))
-	if err := l.write(hello); err != nil {
-		l.close()
-		return nil, err
-	}
+	hello = appendFrame(hello, frSettings, l.settingsText("\npadding-md5="+base.Md5))
+	// Nothing is written yet, also on a lane dialed to warm the pool: the header goes at the start of the
+	// lane's first write. A lane that sent its header and then nothing would stand out; one that sends
+	// nothing at all until it is used, or is closed unused, is what a browser's preconnect looks like.
+	l.prefix = hello
+	l.unauthed.Store(true)
+	l.preauthTTL = jitter(preauthLaneTTL, 0.8)
+	l.idleScale = 0.8 + 0.2*mrand.Float64()
 	l.event("dial")
 	return l, nil
 }
 
+// authPadding is the length of the padding that follows the authentication token: item 0 of the scheme.
+func authPadding(scheme *padding.PaddingFactory) int {
+	if sizes := scheme.GenerateRecordPayloadSizes(0); len(sizes) > 0 && sizes[0] > 0 && sizes[0] <= 0xffff {
+		return sizes[0]
+	}
+	return 0
+}
+
 // ttl is how long the lane ranked rank from the newest (0 = newest) may stay in the pool.
 func (c *Client) ttl(l *lane, rank int) time.Duration {
+	if l.unauthed.Load() {
+		// Never used: the server waits for the header for its handshake timeout only.
+		return l.preauthTTL
+	}
 	d := c.cfg.LaneIdle
 	if rank < warmLanes && d < warmLaneIdle {
 		d = warmLaneIdle
 	}
 	if peer := time.Duration(l.peerIdle.Load()) * time.Second; peer > 10*time.Second && peer-5*time.Second < d {
 		d = peer - 5*time.Second
+	}
+	if l.idleScale > 0 {
+		d = time.Duration(float64(d) * l.idleScale)
 	}
 	return d
 }
@@ -157,9 +219,16 @@ func (c *Client) takeIdle(now time.Time) (*lane, bool) {
 		c.mu.Unlock()
 
 		alive, pending := connAlive(it.l.sock)
-		// Nothing should arrive on an idle lane that has carried a stream: if something has, the server
-		// is closing it (close_notify).
-		if now.Sub(it.since) < c.ttl(it.l, 0) && alive && !(pending && it.used) {
+		// Nothing should arrive on a used idle lane: if something has, the server is closing it
+		// (close_notify). A lane that has not been used yet is different: it has not sent its header,
+		// so the server says nothing on it but may well have sent its post-handshake records (session
+		// tickets — a REALITY server sends them after the client's Finished), which nobody has read.
+		// Those are not a close; the server only closes an unused lane at its handshake timeout, which
+		// preauthLaneTTL stays under. The TLS layer takes the tickets off on the lane's first read.
+		if pending && it.l.unauthed.Load() {
+			pending = false
+		}
+		if now.Sub(it.since) < c.ttl(it.l, 0) && alive && !pending {
 			return it.l, it.used
 		}
 		it.l.close()
@@ -194,12 +263,12 @@ func (c *Client) get(ctx context.Context) (l *lane, pooled, used bool, err error
 			ctx, cancel := context.WithTimeout(context.Background(), defaultDialTimeout)
 			nl, err := c.dial(ctx)
 			cancel()
-			c.mu.Lock()
-			c.pending--
-			c.mu.Unlock()
 			if err == nil {
 				c.put(nl, false)
 			}
+			c.mu.Lock()
+			c.pending--
+			c.mu.Unlock()
 		}()
 	}
 
@@ -225,8 +294,10 @@ func (c *Client) put(l *lane, used bool) {
 	}
 	c.idle = append(c.idle, idleLane{l: l, since: time.Now(), used: used})
 	c.mu.Unlock()
-	time.AfterFunc(c.cfg.LaneIdle+time.Second, c.sweep)
-	time.AfterFunc(warmLaneIdle+time.Second, c.sweep)
+	// Sweep when this lane's time is up, whichever rank it will have then (ttl depends on it only through
+	// being among the warmLanes newest), so that it is closed at its own jittered moment.
+	time.AfterFunc(c.ttl(l, 0)+10*time.Millisecond, c.sweep)
+	time.AfterFunc(c.ttl(l, warmLanes)+10*time.Millisecond, c.sweep)
 }
 
 // sweep closes the idle lanes that have been in the pool for too long.
@@ -249,9 +320,8 @@ func (c *Client) sweep() {
 	}
 }
 
-// CloseIdle closes every idle lane. Call it after the network has changed (Wi-Fi to cellular and the
-// like): the pooled connections are dead by then. Streams in progress are not touched.
-func (c *Client) CloseIdle() {
+// closeIdle closes every idle lane. Streams in progress are not touched.
+func (c *Client) closeIdle() {
 	c.mu.Lock()
 	idle := c.idle
 	c.idle = nil
@@ -267,30 +337,26 @@ func (c *Client) Close() error {
 	c.mu.Lock()
 	c.closed = true
 	c.mu.Unlock()
-	c.CloseIdle()
+	c.closeIdle()
 	return nil
 }
 
-// DialContext opens a stream to address ("host:port"; a domain name is resolved by the server).
-// network must be "tcp", "tcp4" or "tcp6".
+// DialContext opens a stream to destination (a domain name is resolved by the server). A destination
+// of uot.RequestDestination carries UDP over the stream.
 //
 // The call returns as soon as a lane is at hand: the server does not acknowledge the destination, so a
 // target that cannot be reached shows up as an immediate end of stream on the first Read. The returned
 // connection also has a CloseWrite method. Closing it before both directions have ended aborts the
 // stream (the lane still goes back to the pool).
-func (c *Client) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
-	switch network {
-	case "tcp", "tcp4", "tcp6":
-	default:
-		return nil, net.UnknownNetworkError(network)
-	}
-	host, port, err := splitHostPort(address)
-	if err != nil {
+func (c *Client) DialContext(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
+	var addr bytes.Buffer
+	if err := M.SocksaddrSerializer.WriteAddrPort(&addr, destination); err != nil {
 		return nil, err
 	}
-	open, err := socksAddr.append(nil, host, port)
-	if err != nil {
-		return nil, err
-	}
-	return c.open(ctx, appendFrame(nil, frOpen, open), HostPort(address), false)
+	return c.open(ctx, appendFrame(nil, frOpen, addr.Bytes()), destination)
+}
+
+// isUoT reports whether a stream to destination carries UDP packets rather than a byte stream.
+func isUoT(destination M.Socksaddr) bool {
+	return destination.Fqdn == uot.MagicAddress || destination.Fqdn == uot.LegacyMagicAddress
 }

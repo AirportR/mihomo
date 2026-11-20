@@ -6,14 +6,19 @@ import (
 	"errors"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 
+	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/once"
 	tlsC "github.com/metacubex/mihomo/component/tls"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/transport/miu"
 	"github.com/metacubex/mihomo/transport/vmess"
+
+	M "github.com/metacubex/sing/common/metadata"
+	"github.com/metacubex/sing/common/uot"
 
 	"github.com/metacubex/tls"
 )
@@ -31,23 +36,27 @@ type MiuOption struct {
 	Server             string         `proxy:"server"`
 	Port               int            `proxy:"port"`
 	PSK                string         `proxy:"psk"`
-	UDP                bool           `proxy:"udp,omitempty"`
-	TLS                bool           `proxy:"tls,omitempty"` // accepted for compatibility: Miu always runs over TLS
+	PaddingScheme      []string       `proxy:"padding-scheme,omitempty"`
+	ALPN               []string       `proxy:"alpn,omitempty"`
 	SNI                string         `proxy:"sni,omitempty"`
 	ServerName         string         `proxy:"servername,omitempty"` // alias of sni
-	ALPN               []string       `proxy:"alpn,omitempty"`
-	SkipCertVerify     bool           `proxy:"skip-cert-verify,omitempty"`
-	Fingerprint        string         `proxy:"fingerprint,omitempty"`
-	ClientFingerprint  string         `proxy:"client-fingerprint,omitempty"`
+	ECHOpts            ECHOptions     `proxy:"ech-opts,omitempty"`
 	RealityOpts        RealityOptions `proxy:"reality-opts,omitempty"`
+	ClientFingerprint  string         `proxy:"client-fingerprint,omitempty"`
+	SkipCertVerify     bool           `proxy:"skip-cert-verify,omitempty"`
+	NameCertVerify     string         `proxy:"name-cert-verify,omitempty"`
+	Fingerprint        string         `proxy:"fingerprint,omitempty"`
+	Certificate        string         `proxy:"certificate,omitempty"`
+	PrivateKey         string         `proxy:"private-key,omitempty"`
+	UDP                bool           `proxy:"udp,omitempty"`
+	TLS                bool           `proxy:"tls,omitempty"` // accepted for compatibility: Miu always runs over TLS
 	IdleSessionTimeout int            `proxy:"idle-session-timeout,omitempty"`
 	MinIdleSession     int            `proxy:"min-idle-session,omitempty"`
 }
 
 // DialContext implements C.ProxyAdapter
 func (m *Miu) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
-	// The destination goes to the server as it is: a domain name is resolved there.
-	c, err := m.client.DialContext(ctx, "tcp", metadata.RemoteAddress())
+	c, err := m.client.DialContext(ctx, M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort))
 	if err != nil {
 		return nil, err
 	}
@@ -59,12 +68,16 @@ func (m *Miu) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.
 	if err := m.ResolveUDP(ctx, metadata); err != nil {
 		return nil, err
 	}
-	// One UoT stream, on a lane of its own, opened by the first packet written.
-	pc, err := m.client.ListenPacket()
+
+	// create tcp
+	c, err := m.client.DialContext(ctx, uot.RequestDestination(uot.Version))
 	if err != nil {
 		return nil, err
 	}
-	return NewPacketConn(pc, m), nil
+
+	// create uot on tcp
+	destination := M.SocksaddrFromNet(metadata.UDPAddr())
+	return NewPacketConn(N.NewThreadSafePacketConn(uot.NewLazyConn(c, uot.Request{Destination: destination})), m), nil
 }
 
 // SupportUOT implements C.ProxyAdapter
@@ -85,8 +98,8 @@ func (m *Miu) Close() error {
 }
 
 // dialLane opens the outer connection of a lane: TCP through the proxy's dialer, then TLS, uTLS or
-// REALITY. The TLS connection is returned as it is, without any wrapper around it: the library needs
-// to reach into it for raw segments.
+// REALITY. The TLS connection is returned as it is, without any wrapper around it: the transport
+// reaches into it for raw segments.
 func (m *Miu) dialLane(ctx context.Context) (net.Conn, error) {
 	conn, err := m.dialer.DialContext(ctx, "tcp", m.addr)
 	if err != nil {
@@ -100,7 +113,7 @@ func (m *Miu) dialLane(ctx context.Context) (net.Conn, error) {
 	return tlsConn, nil
 }
 
-// miuRawUsable checks, once, that the library's raw segments work on the two kinds of TLS connection
+// miuRawUsable checks, once, that the transport's raw segments work on the two kinds of TLS connection
 // vmess.StreamTLSConn can return here: *tls.Conn of metacubex/tls and *utls.UConn of metacubex/utls
 // (the latter is also what a REALITY handshake yields).
 var miuRawUsable = once.OnceValue(func() bool {
@@ -139,6 +152,10 @@ func NewMiu(option MiuOption) (*Miu, error) {
 	}
 	outbound.dialer = option.NewDialer(outbound.DialOptions())
 
+	echConfig, err := option.ECHOpts.Parse()
+	if err != nil {
+		return nil, err
+	}
 	realityConfig, err := option.RealityOpts.Parse()
 	if err != nil {
 		return nil, err
@@ -150,24 +167,29 @@ func NewMiu(option MiuOption) (*Miu, error) {
 	if sni == "" {
 		sni = option.ServerName
 	}
-	if sni == "" {
-		sni = option.Server
-	}
 	outbound.tlsConfig = &vmess.TLSConfig{
 		Host:              sni,
 		SkipCertVerify:    option.SkipCertVerify,
-		FingerPrint:       option.Fingerprint,
+		NameCertVerify:    option.NameCertVerify,
 		NextProtos:        option.ALPN,
+		FingerPrint:       option.Fingerprint,
+		Certificate:       option.Certificate,
+		PrivateKey:        option.PrivateKey,
 		ClientFingerprint: option.ClientFingerprint,
+		ECH:               echConfig,
 		Reality:           realityConfig,
+	}
+	if outbound.tlsConfig.Host == "" {
+		outbound.tlsConfig.Host = option.Server
 	}
 
 	outbound.client, err = miu.NewClient(miu.ClientConfig{
-		PSK:        option.PSK,
-		Dial:       outbound.dialLane,
-		LaneIdle:   time.Duration(option.IdleSessionTimeout) * time.Second,
-		MinIdle:    option.MinIdleSession,
-		DisableRaw: !miuRawUsable(),
+		PSK:           option.PSK,
+		PaddingScheme: strings.Join(option.PaddingScheme, "\n"),
+		Dial:          outbound.dialLane,
+		LaneIdle:      time.Duration(option.IdleSessionTimeout) * time.Second,
+		MinIdle:       option.MinIdleSession,
+		DisableRaw:    !miuRawUsable(),
 	})
 	if err != nil {
 		return nil, err

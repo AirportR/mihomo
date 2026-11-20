@@ -3,7 +3,6 @@ package miu
 import (
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 )
 
@@ -13,7 +12,7 @@ const (
 	frSettings       = 1 // C→S text
 	frServerSettings = 2 // S→C text
 	frUpdatePadding  = 3 // S→C padding scheme text
-	frOpen           = 4 // C→S socksAddr destination
+	frOpen           = 4 // C→S destination, as a SOCKS address
 	frData           = 5 // payload, encrypted once by the outer TLS
 	frRaw            = 6 // u32 BE = N: N bytes follow on TCP outside the outer TLS. Last frame of its record
 	frEnd            = 7 // this direction is finished
@@ -48,8 +47,7 @@ func appendData(dst, p []byte) []byte {
 	return dst
 }
 
-// minInt is the builtin min of Go 1.21. This package keeps to the language and library of Go 1.20,
-// so that it can be copied into projects that still build with it.
+// minInt is the builtin min of Go 1.21.
 func minInt(a, b int) int {
 	if a < b {
 		return a
@@ -77,14 +75,6 @@ func kvInt(m map[string]string, key string) (int64, bool) {
 	n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
 	return n, err == nil
 }
-
-// bufSize is the size of the pooled scratch buffers used to move payload around.
-const bufSize = 32 << 10
-
-var bufPool = sync.Pool{New: func() any { b := make([]byte, bufSize); return &b }}
-
-func getBuf() *[]byte  { return bufPool.Get().(*[]byte) }
-func putBuf(b *[]byte) { bufPool.Put(b) }
 
 // testObserver is only set by tests, to assert which code path was taken.
 var testObserver atomic.Pointer[func(event string)]

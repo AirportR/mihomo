@@ -16,10 +16,10 @@ var (
 // and rawInput (read from the socket, not yet parsed). Entering and leaving a raw segment needs both to
 // line the TLS layer up with the socket underneath it.
 //
-// The fields are found by name and type through reflection, so crypto/tls.Conn and the forks that keep
-// its layout (uTLS's Conn and UConn) all work without this package importing them. ok is false for any
-// other connection, or when a future TLS implementation renames the fields; the lane then simply runs
-// without raw segments.
+// The fields are found by name and type through reflection, so every connection that keeps the layout
+// of crypto/tls.Conn works: the Conn of metacubex/tls, the Conn and UConn of metacubex/utls, and the
+// structs that embed one of them (the REALITY listener's wrapper). ok is false for any other connection,
+// or when a future TLS implementation renames the fields; the lane then simply runs without raw segments.
 func tlsBuffers(conn net.Conn) (input *bytes.Reader, rawInput *bytes.Buffer, sock net.Conn, ok bool) {
 	defer func() {
 		if recover() != nil {
@@ -31,11 +31,14 @@ func tlsBuffers(conn net.Conn) (input *bytes.Reader, rawInput *bytes.Buffer, soc
 		return nil, nil, nil, false
 	}
 	v := reflect.ValueOf(conn)
-	if v.Kind() != reflect.Pointer || v.IsNil() || v.Elem().Kind() != reflect.Struct {
+	if v.Kind() == reflect.Pointer {
+		v = v.Elem()
+	}
+	if v.Kind() != reflect.Struct {
 		return nil, nil, nil, false
 	}
-	in, ok1 := fieldPointer(v.Elem(), "input", typeBytesReader)
-	rin, ok2 := fieldPointer(v.Elem(), "rawInput", typeBytesBuffer)
+	in, ok1 := fieldPointer(v, "input", typeBytesReader)
+	rin, ok2 := fieldPointer(v, "rawInput", typeBytesBuffer)
 	if !ok1 || !ok2 {
 		return nil, nil, nil, false
 	}
